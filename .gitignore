@@ -1,0 +1,5 @@
+launcher.spec
+
+build/
+dist/
+.venv/
