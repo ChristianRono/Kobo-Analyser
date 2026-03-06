@@ -23,7 +23,7 @@ def run_streamlit(port):
     else:
         base_path = os.path.dirname(os.path.abspath(__file__))
 
-    app_path = os.path.join(base_path, "app.py")
+    app_path = os.path.join(base_path, "kobo_dashboard.py")
 
     sys.argv = [
         "streamlit",
