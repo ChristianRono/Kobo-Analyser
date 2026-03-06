@@ -182,6 +182,8 @@ HEADER_ALIASES = {
     "_submitted_by":                      "submitted_by",
     "_id":                                "row_id",
     "_index":                             "row_index",
+    "_Record your current location_longitude": "longitude",
+    "_Record your current location_latitude": "latitude",
 }
 
 
