@@ -1,15 +1,19 @@
 """
-Home — File upload, date range & filter controls.
-All selections are stored in st.session_state and shared across pages.
+Home — KoboToolbox API integration, date range & filter controls.
+Server  : kobo.humanitarianresponse.info (OCHA)
+Auth    : API Token
+Form    : hardcoded ASSET_UID constant below
 """
 
 import streamlit as st
 import pandas as pd
+import requests
 from utils import (
     inject_css, sidebar_logo, sidebar_divider, sidebar_user,
     load_data, apply_filters, no_data_screen,
     NAVY, GOLD, CREAM, WHITE, MUTED, GREEN, RED,
-    ATTENDANCE_NOTE, ATTENDANCE_NOTE_SHORT
+    ATTENDANCE_NOTE, ATTENDANCE_NOTE_SHORT,
+    kpi, get_api_token
 )
 
 st.set_page_config(
@@ -20,39 +24,114 @@ st.set_page_config(
 )
 inject_css()
 
+# ── KoboToolbox config ────────────────────────────────────────────────────────
+
+KOBO_BASE = "https://eu.kobotoolbox.org"
+ASSET_UID = "aE853iuHXzSP89M2gRyhAF"   # ← replace with your form's Asset UID
+API_TOKEN = '5d993dfcfc61a0753c5d404268b0c5c6a9789a81'
+
+
+def kobo_headers(token: str) -> dict:
+    return {"Authorization": f"Token {token}"}
+
+
+@st.cache_data(show_spinner="Downloading submissions from KoboToolbox…", ttl=300)
+def fetch_submissions(token: str) -> pd.DataFrame:
+    """Download all submissions for ASSET_UID and return as a DataFrame."""
+    url = f"{KOBO_BASE}/api/v2/assets/{ASSET_UID}/data/?format=json&limit=30000"
+    rows = []
+    while url:
+        r = requests.get(url, headers=kobo_headers(token), timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        rows.extend(data.get("results", []))
+        url = data.get("next")
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     sidebar_logo()
     sidebar_divider()
 
+    # ── API token ─────────────────────────────────────────────────────────────
     st.markdown(
         f'<div style="font-size:10px;text-transform:uppercase;letter-spacing:.12em;'
-        f'color:{MUTED};font-weight:600;margin-bottom:6px;">📂 Data Source</div>',
+        f'color:{MUTED};font-weight:600;margin-bottom:6px;">🔑 KoboToolbox API</div>',
         unsafe_allow_html=True,
     )
-    uploaded = st.file_uploader(
-        "Upload Kobo Excel Export (.xlsx)",
-        type=["xlsx", "xls"],
-        label_visibility="collapsed",
-        key="file_uploader",
-    )
 
-    if uploaded:
-        file_bytes = uploaded.read()
-        # Only reload if file changed
-        if st.session_state.get("file_name") != uploaded.name:
-            raw_df, warns = load_data(file_bytes)
-            st.session_state["raw_df"]    = raw_df
-            st.session_state["file_name"] = uploaded.name
-            st.session_state["load_warns"] = warns
-            # Reset filters on new file
-            valid = raw_df["session_date"].dropna()
-            st.session_state["date_from"] = valid.min().date()
-            st.session_state["date_to"]   = valid.max().date()
-            st.session_state["f_county"]  = []
-            st.session_state["f_trainer"] = []
-            st.session_state["f_module"]  = []
-            st.session_state["f_level"]   = []
+    if "api_token" not in st.session_state:
+        st.session_state["api_token"] = get_api_token() or ""
+
+    env_token = get_api_token()
+
+    if not env_token:
+        st.text_input(
+            "API Token",
+            type="password",
+            placeholder="Paste your API token…",
+            label_visibility="collapsed",
+            key="api_token",
+        )
+    else:
+        st.markdown(
+            f'<div style="font-size:12px;color:{MUTED};">✅ Token loaded from environment.</div>',
+            unsafe_allow_html=True,
+        )
+
+    api_token = st.session_state.get("api_token", "")
+
+
+    if api_token:
+        load_btn = st.button("⬇ Load / Refresh Data", use_container_width=True)
+
+        # Auto-load on first valid token; manual reload via button afterwards
+        auto_load = (
+            api_token != st.session_state.get("loaded_token")
+            and "raw_df" not in st.session_state
+        )
+
+        if load_btn or auto_load:
+            try:
+                fetch_submissions.clear()
+                raw_submissions = fetch_submissions(api_token)
+                raw_df, warns = load_data(raw_submissions)
+                st.session_state["raw_df"]       = raw_df
+                st.session_state["loaded_token"] = api_token
+                st.session_state["load_warns"]   = warns
+                st.session_state["file_name"]    = ASSET_UID
+                valid = raw_df["session_date"].dropna()
+                if not valid.empty:
+                    st.session_state["date_from"] = valid.min().date()
+                    st.session_state["date_to"]   = valid.max().date()
+                st.session_state["f_county"]  = []
+                st.session_state["f_trainer"] = []
+                st.session_state["f_module"]  = []
+                st.session_state["f_level"]   = []
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 401:
+                    st.error("Invalid API token — please check and try again.", icon="🔒")
+                elif e.response is not None and e.response.status_code == 404:
+                    st.error(
+                        f"Form not found. Check ASSET_UID in Home.py: `{ASSET_UID}`",
+                        icon="🔍",
+                    )
+                else:
+                    st.error(f"KoboToolbox error: {e}", icon="🚨")
+            except requests.exceptions.ConnectionError:
+                st.error(
+                    "Cannot reach kobo.humanitarianresponse.info. "
+                    "Check your internet connection.",
+                    icon="🌐",
+                )
+            except Exception as e:
+                st.error(f"Unexpected error: {e}", icon="🚨")
+    else:
+        st.markdown(
+            f'<div style="font-size:12px;color:{MUTED};">Enter your API token to begin.</div>',
+            unsafe_allow_html=True,
+        )
 
     raw_df = st.session_state.get("raw_df", None)
 
@@ -69,10 +148,10 @@ with st.sidebar:
         valid = raw_df["session_date"].dropna()
         min_d, max_d = valid.min().date(), valid.max().date()
 
-        d_from = st.date_input("From", value=st.session_state.get("date_from", min_d),
-                               min_value=min_d, max_value=max_d, key="date_from")
-        d_to   = st.date_input("To",   value=st.session_state.get("date_to",   max_d),
-                               min_value=min_d, max_value=max_d, key="date_to")
+        st.date_input("From", value=st.session_state.get("date_from", min_d),
+                      min_value=min_d, max_value=max_d, key="date_from")
+        st.date_input("To",   value=st.session_state.get("date_to",   max_d),
+                      min_value=min_d, max_value=max_d, key="date_to")
 
         sidebar_divider()
         st.markdown(
@@ -94,15 +173,8 @@ with st.sidebar:
                 sorted(raw_df["level"].replace("", pd.NA).dropna().unique()),
                 default=st.session_state.get("f_level", []), key="f_level")
 
-        # Store filtered df in session state so all pages can use it
         filtered = apply_filters(raw_df)
         st.session_state["filtered_df"] = filtered
-
-    else:
-        st.markdown(
-            f'<div style="font-size:12px;color:{MUTED};">Upload a file to begin.</div>',
-            unsafe_allow_html=True,
-        )
 
     sidebar_divider()
     sidebar_user()
@@ -124,7 +196,7 @@ st.markdown(f"""
         TcnAfrica Field Report Dashboard
     </div>
     <div style="font-size:14px;color:#a0b4cc;margin-bottom:16px;">
-        Kobo Collect  ·  {st.session_state.get('file_name','—')}
+        KoboToolbox Live Data  ·  {st.session_state.get('file_name', '—')}
     </div>
     <div style="display:flex;gap:24px;flex-wrap:wrap;">
         <div style="color:{GOLD};font-size:13px;font-weight:600;">
@@ -151,18 +223,17 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-n_sessions  = len(df)
-n_enrolled  = int(df["total_learners"].sum())
-n_attended  = int(df["attended"].sum())
-n_absent    = int(df["absent"].sum())
-att_rate    = f"{n_attended/n_enrolled*100:.1f}%" if n_enrolled else "—"
-n_counties  = df["county"].nunique()
-n_trainers  = df["trainer_name"].nunique()
-fee_total   = df["fee_received"].sum()
-grad_total  = df["graduation_fee"].sum()
-county_str  = " · ".join(sorted(df["county"].replace("", pd.NA).dropna().unique()))
+n_sessions = len(df)
+n_enrolled = int(df["total_learners"].sum())
+n_attended = int(df["attended"].sum())
+n_absent   = int(df["absent"].sum())
+att_rate   = f"{n_attended/n_enrolled*100:.1f}%" if n_enrolled else "—"
+n_counties = df["county"].nunique()
+n_trainers = df["trainer_name"].nunique()
+fee_total  = df["fee_received"].sum()
+grad_total = df["graduation_fee"].sum()
+county_str = " · ".join(sorted(df["county"].replace("", pd.NA).dropna().unique()))
 
-from utils import kpi
 k1, k2, k3, k4, k5 = st.columns(5)
 with k1:
     st.markdown(kpi("Sessions", f"{n_sessions:,}", "Kobo submissions",
@@ -171,11 +242,9 @@ with k1:
 with k2:
     st.markdown(kpi("Session-Attendances", f"{n_attended:,}",
                     f"Rate: {att_rate}", "tag-green",
-                    f"of {n_enrolled:,} enrolled",
-                    "kpi-green",
-                    note=ATTENDANCE_NOTE_SHORT if True else ""),
+                    f"of {n_enrolled:,} enrolled", "kpi-green",
+                    note=ATTENDANCE_NOTE_SHORT),
                 unsafe_allow_html=True)
-
 with k3:
     ab_pct = f"{n_absent/n_enrolled*100:.1f}%" if n_enrolled else "—"
     st.markdown(kpi("Absences", f"{n_absent:,}", f"{ab_pct} of enrolled",
@@ -191,7 +260,6 @@ with k5:
                     f"Fee {fee_total:,.0f} + Grad {grad_total:,.0f}", "kpi-navy"),
                 unsafe_allow_html=True)
 
-
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
 # ── Navigation cards ──────────────────────────────────────────────────────────
@@ -204,6 +272,7 @@ st.markdown(
 
 nav1, nav2, nav3, nav4 = st.columns(4)
 
+
 def nav_card(icon, title, desc, colour=NAVY):
     return (
         f'<div style="background:{WHITE};border-radius:10px;padding:22px 20px;'
@@ -215,6 +284,7 @@ def nav_card(icon, title, desc, colour=NAVY):
         f'<div style="font-size:12px;color:{MUTED};">{desc}</div>'
         f'</div>'
     )
+
 
 with nav1:
     st.markdown(nav_card("📊", "Overview",

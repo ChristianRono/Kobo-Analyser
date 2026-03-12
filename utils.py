@@ -14,6 +14,18 @@ import streamlit as st
 
 warnings.filterwarnings("ignore")
 
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # loads .env when running locally; no-op on Streamlit Cloud
+
+def get_api_token() -> str:
+    """Load token from Streamlit secrets (cloud) or .env (local)."""
+    try:
+        return st.secrets["KOBO_API_TOKEN"]
+    except (KeyError, FileNotFoundError):
+        return os.getenv("KOBO_API_TOKEN", "")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PALETTE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +237,37 @@ HEADER_ALIASES = {
     "_record your current location_latitude":  "latitude",
     "_record your current location_longitude": "longitude",
     "_index":                                  "row_index",
+
+    # ── Kobo API group-prefixed aliases ────────────────────────────────────
+    "group_vi7dq15/enter_facilitators_name":        "trainer_name",
+    "group_vi7dq15/enter_a_date_and_time":          "session_date",
+    "group_es1rh04/enter_county":                   "county",
+    "group_es1rh04/enter_class_name_bomet_county":  "class_bomet",
+    "group_es1rh04/enter_class_name_kericho_county":"class_kericho",
+    "group_es1rh04/enter_class_name_narok_county":  "class_narok",
+    "group_es1rh04/type_in_ward_name":              "ward",
+    "group_es1rh04/select_module":                  "module",
+    "group_es1rh04/type_in_lesson_taught":          "lesson",
+    "group_es1rh04/type_in_field_assign_n_a_if_not_not_done": "assignment",
+    "group_es1rh04/total_number_of_learners":       "total_learners",
+    "group_es1rh04/learners_that_attended_class":   "attended",
+    "group_es1rh04/absent_learners":                "absent",
+    "group_es1rh04/select_class_level":             "level",
+    "group_es1rh04/class_attendance":               "attendance_photo_url",
+    "group_qm5qq25/total_fee_received":             "fee_received",
+    "group_qm5qq25/take_photo_of_payment_information": "payment_photo_url",
+    "group_qm5qq25/transaction_code_if_fee_sent":   "transaction_code",
+    "group_qm5qq25/graduation_fee_if_received":     "graduation_fee",
+    "group_jm2xr29/enter_tla_actual_amount":        "tla_amount",
+    "group_jm2xr29/class_requirement":              "remarks",
+    "group_jm2xr29/other_comment":                  "remarks",  # fallback if remarks not yet mapped
+    "record_your_current_location":                 "geolocation",
+    "_geolocation":                                 "geolocation",
+    "_submission_time":                             "submission_time",
+    "_uuid":                                        "uuid",
+    "start":                                        "start_dt",
+    "end":                                          "end_dt",
+    "_attachments":                                 "attachments",
 }
 
 
@@ -238,14 +281,11 @@ def _coerce_date(val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return pd.NaT
     if isinstance(val, (datetime, date)):
-        return pd.Timestamp(val)
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-        try:
-            return pd.to_datetime(str(val).strip(), format=fmt)
-        except Exception:
-            pass
+        ts = pd.Timestamp(val)
+        return ts.tz_localize(None) if ts.tzinfo is not None else ts
     try:
-        return pd.to_datetime(str(val).strip(), infer_datetime_format=True, dayfirst=True)
+        ts = pd.to_datetime(str(val).strip(), utc=True)
+        return ts.tz_convert(None)   # strips tz, keeps local time value
     except Exception:
         return pd.NaT
 
@@ -256,44 +296,73 @@ def _coerce_num(series: pd.Series) -> pd.Series:
         return s if s else "0"
     return pd.to_numeric(series.apply(clean), errors="coerce").fillna(0)
 
-
 @st.cache_data(show_spinner="Loading data…")
-def load_data(file_bytes: bytes) -> tuple:
+def load_data(source: bytes | pd.DataFrame) -> tuple:
     load_warns: list[str] = []
-    buf = io.BytesIO(file_bytes)
-    raw = pd.read_excel(buf, header=None, dtype=object)
 
-    header_idx = None
-    for i in range(min(6, len(raw))):
-        vals = [_norm(v) for v in raw.iloc[i]]
-        if any(v in ("start", "end") or "county" in v
-               or "facilitator" in v or "date and time" in v for v in vals):
-            header_idx = i
-            break
-    if header_idx is None:
-        header_idx = 0
-        load_warns.append("Header row not auto-detected; assuming row 1.")
+    # ── Normalise input to a raw DataFrame ───────────────────────────────────
+    if isinstance(source, pd.DataFrame):
+        # Coming from KoboToolbox API: already a flat DataFrame.
+        # Treat every column header as a potential alias to remap.
+        raw_headers = list(source.columns)
+        data = source.copy().reset_index(drop=True)
 
-    raw_headers = list(raw.iloc[header_idx])
-    data = raw.iloc[header_idx + 1:].reset_index(drop=True)
+        col_map: dict = {}
+        used: set = set()
+        for i, h in enumerate(raw_headers):
+            n = _norm(h)
+            matched = None
+            if n in HEADER_ALIASES:
+                matched = HEADER_ALIASES[n]
+            else:
+                for alias, internal in HEADER_ALIASES.items():
+                    if alias and n and (alias in n or n.startswith(alias[:12])):
+                        matched = internal
+                        break
+            if matched and matched not in used:
+                col_map[i] = matched
+                used.add(matched)
 
-    col_map: dict = {}
-    used: set = set()
-    for i, h in enumerate(raw_headers):
-        n = _norm(h)
-        matched = None
-        if n in HEADER_ALIASES:
-            matched = HEADER_ALIASES[n]
-        else:
-            for alias, internal in HEADER_ALIASES.items():
-                if alias and n and (alias in n or n.startswith(alias[:12])):
-                    matched = internal
-                    break
-        if matched and matched not in used:
-            col_map[i] = matched
-            used.add(matched)
+        data.columns = [col_map.get(i, f"_x{i}") for i in range(len(data.columns))]
 
-    data.columns = [col_map.get(i, f"_x{i}") for i in range(len(data.columns))]
+    else:
+        # Coming from a file upload: bytes → Excel → header detection.
+        buf = io.BytesIO(source)
+        raw = pd.read_excel(buf, header=None, dtype=object)
+
+        header_idx = None
+        for i in range(min(6, len(raw))):
+            vals = [_norm(v) for v in raw.iloc[i]]
+            if any(v in ("start", "end") or "county" in v
+                   or "facilitator" in v or "date and time" in v for v in vals):
+                header_idx = i
+                break
+        if header_idx is None:
+            header_idx = 0
+            load_warns.append("Header row not auto-detected; assuming row 1.")
+
+        raw_headers = list(raw.iloc[header_idx])
+        data = raw.iloc[header_idx + 1:].reset_index(drop=True)
+
+        col_map: dict = {}
+        used: set = set()
+        for i, h in enumerate(raw_headers):
+            n = _norm(h)
+            matched = None
+            if n in HEADER_ALIASES:
+                matched = HEADER_ALIASES[n]
+            else:
+                for alias, internal in HEADER_ALIASES.items():
+                    if alias and n and (alias in n or n.startswith(alias[:12])):
+                        matched = internal
+                        break
+            if matched and matched not in used:
+                col_map[i] = matched
+                used.add(matched)
+
+        data.columns = [col_map.get(i, f"_x{i}") for i in range(len(data.columns))]
+
+    # ── Everything below is shared between both paths ─────────────────────────
     keep = [c for c in data.columns if not c.startswith("_x")]
     df = data[keep].copy()
 
@@ -325,7 +394,7 @@ def load_data(file_bytes: bytes) -> tuple:
                "attendance_photo_url", "uuid"]:
         if tc in df.columns:
             df[tc] = (df[tc].astype(str).str.strip()
-                           .apply(lambda x: "" if x.lower() in BAD else x))
+                            .apply(lambda x: "" if x.lower() in BAD else x))
 
     if "trainer_name" in df.columns:
         df["trainer_name"] = df["trainer_name"].str.title().str.strip()
@@ -383,9 +452,12 @@ def get_filters():
 
 
 def apply_filters(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """Apply all session-state filters to raw_df and return result."""
     f = get_filters()
     df = raw_df.copy()
+
+    # Guarantee session_date is tz-naive datetime before .dt.date access
+    df["session_date"] = pd.to_datetime(df["session_date"], errors="coerce").dt.tz_localize(None)
+
     if f["date_from"] and f["date_to"]:
         df = df[(df["session_date"].dt.date >= f["date_from"]) &
                 (df["session_date"].dt.date <= f["date_to"])]

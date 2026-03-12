@@ -58,8 +58,26 @@ if df is None or df.empty:
     no_data_screen()
     st.stop()
 
-d_from = st.session_state.get("date_from")
-d_to   = st.session_state.get("date_to")
+# ── Robust date resolution ─────────────────────────────────────────────────────
+# Always derive from the dataframe as ground truth; session_state is a best-effort
+# override. This means dates survive page reloads, re-runs, and button clicks.
+def _resolve_dates(df: pd.DataFrame):
+    valid = df["session_date"].dropna()
+    df_min = valid.min().date() if not valid.empty else None
+    df_max = valid.max().date() if not valid.empty else None
+
+    d_from = st.session_state.get("date_from") or df_min
+    d_to   = st.session_state.get("date_to")   or df_max
+
+    # If session state held a datetime instead of a date, normalise it
+    if hasattr(d_from, "date"):
+        d_from = d_from.date()
+    if hasattr(d_to, "date"):
+        d_to = d_to.date()
+
+    return d_from, d_to
+
+d_from, d_to = _resolve_dates(df)
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(
@@ -111,9 +129,11 @@ with p2:
 with p3:
     st.metric("Counties", df["county"].nunique())
 with p4:
-    st.metric("Date Range",
-              f"{d_from.strftime('%d %b %Y') if d_from else '—'} → "
-              f"{d_to.strftime('%d %b %Y') if d_to else '—'}")
+    date_range_str = (
+        f"{d_from.strftime('%d %b %Y') if d_from else '—'} → "
+        f"{d_to.strftime('%d %b %Y')   if d_to   else '—'}"
+    )
+    st.metric("Date Range", date_range_str)
 
 st.caption(f"* {ATTENDANCE_NOTE_SHORT}")
 st.markdown("<hr>", unsafe_allow_html=True)
@@ -177,6 +197,13 @@ def generate_pdf(df, d_from, d_to,
         ]))
         return t
 
+    # Format dates safely — always derive from df if d_from/d_to still None
+    valid = df["session_date"].dropna()
+    _d_from = d_from or (valid.min().date() if not valid.empty else None)
+    _d_to   = d_to   or (valid.max().date() if not valid.empty else None)
+    from_str = _d_from.strftime("%d %b %Y") if _d_from else "—"
+    to_str   = _d_to.strftime("%d %b %Y")   if _d_to   else "—"
+
     story = []
     total_sessions = len(df)
     total_enrolled = int(df["total_learners"].sum())
@@ -189,7 +216,7 @@ def generate_pdf(df, d_from, d_to,
     story.append(Paragraph("TcnAfrica", title_s))
     story.append(Paragraph("Field Training Report", gold_s))
     story.append(Paragraph(
-        f"Period: {d_from.strftime('%d %b %Y') if d_from else '—'} — {d_to.strftime('%d %b %Y') if d_to else '—'}  ·  "
+        f"Period: {from_str} — {to_str}  ·  "
         f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')}", sub_s))
     story.append(HRFlowable(width="100%", thickness=2, color=rl_gold, spaceAfter=14))
     story.append(Paragraph(
@@ -219,10 +246,10 @@ def generate_pdf(df, d_from, d_to,
     if inc_charts and HAS_KALEIDO:
         from reportlab.platypus import Image as RLImage
         for key, title, make_fig, export_h, display_h in [
-            ("trend",   "Session-Attendance Trend Over Time",   fig_trend,   340, 7.0),
+            ("trend",   "Session-Attendance Trend Over Time",     fig_trend,   340, 7.0),
             ("monthly", "Monthly Sessions & Session-Attendances", fig_monthly, 380, 7.8),
-            ("fees",    "Monthly Collections (KES)",            fig_fees,    360, 7.2),
-            ("county",  "Session-Attendances by County",        fig_county,  360, 7.2),
+            ("fees",    "Monthly Collections (KES)",              fig_fees,    360, 7.2),
+            ("county",  "Session-Attendances by County",          fig_county,  360, 7.2),
         ]:
             fig = make_fig(df)
             story.append(Paragraph(title, sec_s))
@@ -309,7 +336,6 @@ def generate_pdf(df, d_from, d_to,
                      "ward","module","level","attended","absent","fee_received"]
         disp = df[[c for c in disp_cols if c in df.columns]].copy()
         disp["session_date"] = disp["session_date"].dt.strftime("%d %b %Y")
-        # rename attended column
         disp = disp.rename(columns={"attended": "Attend.*"})
         col_headers = [c.replace("_"," ").title() for c in disp.columns]
         td = [col_headers] + [[str(v) for v in r] for r in disp.values.tolist()]
@@ -350,9 +376,11 @@ if st.button("⬇  Generate PDF Report", type="primary"):
             inc_module, inc_trainer, inc_notes, inc_rawdata,
         )
 
-    fname = (f"TcnAfrica_Report_"
-             f"{d_from.strftime('%Y%m%d') if d_from else 'all'}_"
-             f"{d_to.strftime('%Y%m%d') if d_to else 'all'}.pdf")
+    fname = (
+        f"TcnAfrica_Report_"
+        f"{d_from.strftime('%Y%m%d') if d_from else 'all'}_"
+        f"{d_to.strftime('%Y%m%d')   if d_to   else 'all'}.pdf"
+    )
 
     st.success("✅ PDF ready!")
     st.download_button(
