@@ -1,5 +1,6 @@
 launcher.spec
 *.pyc
+.env
 
 __pycache__/
 
